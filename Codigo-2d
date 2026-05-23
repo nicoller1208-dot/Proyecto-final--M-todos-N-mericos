@@ -1,0 +1,1004 @@
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import os
+import json
+
+
+from scipy.sparse import lil_matrix, dok_matrix
+from scipy.sparse.linalg import spsolve
+
+
+BG      = "#0D0F14"
+PANEL   = "#13161E"
+CARD    = "#1A1E2A"
+BORDER  = "#252A38"
+ACCENT  = "#F5B942"
+ACCENT2 = "#E07B39"
+TEXT    = "#DDE1EC"
+MUTED   = "#5C6380"
+DIM     = "#3A3F55"
+SUCCESS = "#4ADE80"
+INFO    = "#60A5FA"
+DANGER  = "#F87171"
+WARN    = "#FBBF24"
+
+PLT_BG   = "#0D0F14"
+
+CMAPS = ["inferno", "viridis", "plasma", "magma", "hot", "cividis"]
+PLT_FACE = "#13161E"
+PLT_GRID = "#1E2232"
+
+
+hbar = 1.0
+m    = 1.0
+
+
+def crear_malla_2d(Nx, Ny, Lx=8.0, Ly=8.0):
+    """
+    Devuelve:
+      x, y  : arrays 1D de coordenadas
+      XX, YY: meshgrids
+      hx, hy: tamaños de elemento
+    """
+    x  = np.linspace(-Lx, Lx, Nx)
+    y  = np.linspace(-Ly, Ly, Ny)
+    XX, YY = np.meshgrid(x, y)          # shape (Ny, Nx)
+    hx = x[1] - x[0]
+    hy = y[1] - y[0]
+    return x, y, XX, YY, hx, hy
+
+def idx(i, j, Nx):
+    """Índice global del nodo (i,j) → fila i, columna j."""
+    return i * Nx + j
+
+
+def ensamblar_2d_lil(Nx, Ny, hx, hy):
+    
+    N   = Nx * Ny
+    # Crear en formato LIL 
+    M_lil = lil_matrix((N, N), dtype=complex)
+    K_lil = lil_matrix((N, N), dtype=complex)
+
+    # Matrices elementales Q4 analíticas (integración exacta 2×2 Gauss)
+    Me, Ke = _elem_matrices_q4(hx, hy)
+
+    for i in range(Ny - 1):          # filas de elementos
+        for j in range(Nx - 1):      # columnas de elementos
+            # índices globales de los 4 nodos del elemento
+            dofs = [
+                idx(i,   j,   Nx),   # 0
+                idx(i,   j+1, Nx),   # 1
+                idx(i+1, j+1, Nx),   # 2
+                idx(i+1, j,   Nx),   # 3
+            ]
+            # Ensamblaje en LIL (inserción eficiente)
+            for a in range(4):
+                for b in range(4):
+                    M_lil[dofs[a], dofs[b]] += Me[a, b]
+                    K_lil[dofs[a], dofs[b]] += Ke[a, b]
+
+    
+    M_csr = M_lil.tocsr()
+    K_csr = K_lil.tocsr()
+    return M_csr, K_csr
+
+
+def ensamblar_V_2d_dok(V_flat):
+    """
+    Construye la matriz diagonal del potencial usando DOK
+    (Dictionary of Keys), luego convierte a CSR.
+    DOK es ideal para matrices con entradas en posiciones arbitrarias.
+    Solo almacena entradas significativas (|V| > umbral).
+    """
+    N     = len(V_flat)
+    V_dok = dok_matrix((N, N), dtype=complex)
+    for i, v in enumerate(V_flat):
+        if abs(v) > 1e-15:          # umbral robusto frente a NaN/subnormals
+            V_dok[i, i] = complex(v)
+    
+    return V_dok.tocsr()
+
+
+def _elem_matrices_q4(hx, hy):
+    """
+    Matrices de masa y rigidez para elemento cuadrilátero Q4
+    mediante integración de Gauss 2×2.
+    """
+    # Puntos y pesos de Gauss en [-1,1]
+    gp = np.array([-1, 1]) / np.sqrt(3)
+    gw = np.array([1.0, 1.0])
+
+    Me = np.zeros((4, 4))
+    Ke = np.zeros((4, 4))
+
+    for xi, wx in zip(gp, gw):
+        for eta, wy in zip(gp, gw):
+            # Funciones de forma N_a(xi, eta)
+            N = 0.25 * np.array([
+                (1 - xi) * (1 - eta),
+                (1 + xi) * (1 - eta),
+                (1 + xi) * (1 + eta),
+                (1 - xi) * (1 + eta),
+            ])
+            # Derivadas ∂N/∂xi  y  ∂N/∂eta
+            dN_dxi  = 0.25 * np.array([-(1-eta),  (1-eta),  (1+eta), -(1+eta)])
+            dN_deta = 0.25 * np.array([-(1-xi),  -(1+xi),   (1+xi),  (1-xi) ])
+
+            # Jacobiano  J = [[dx/dxi, dy/dxi],[dx/deta, dy/deta]]
+            # Para elemento rectangular: dx/dxi = hx/2, dy/deta = hy/2
+            jac  = (hx / 2) * (hy / 2)   # det(J)
+
+            # Gradientes en coordenadas físicas
+            dN_dx = dN_dxi  * (2 / hx)
+            dN_dy = dN_deta * (2 / hy)
+
+            w = wx * wy * jac
+
+            Me += w * np.outer(N, N)
+            Ke += w * (np.outer(dN_dx, dN_dx) + np.outer(dN_dy, dN_dy))
+
+    return Me, Ke
+
+
+
+def aplicar_dirichlet_2d_csr(A, border_dofs):
+    """
+    Aplica condición ψ = 0 en los nodos del borde.
+    Trabaja con la matriz en formato CSR (o LIL internamente).
+    """
+    A_lil = A.tolil()
+    for dof in border_dofs:
+        A_lil[dof, :] = 0
+        A_lil[dof, dof] = 1
+    return A_lil.tocsr()
+
+def obtener_borde_dofs(Nx, Ny):
+    dofs = set()
+    for j in range(Nx):
+        dofs.add(idx(0, j, Nx))
+        dofs.add(idx(Ny-1, j, Nx))
+    for i in range(Ny):
+        dofs.add(idx(i, 0, Nx))
+        dofs.add(idx(i, Nx-1, Nx))
+    return list(dofs)
+
+
+
+def potencial_2d(XX, YY, tipo):
+    if tipo == "Libre":
+        return np.zeros_like(XX)
+    if tipo == "Armónico":
+        return 0.5 * (XX**2 + YY**2)
+    if tipo == "Barrera":
+        V = np.zeros_like(XX)
+        V[np.abs(XX) < 1.0] += 10.0
+        return V
+    if tipo == "Doble Pozo":
+        return 0.5 * (XX**2 - 2)**2 * 0.3
+    if tipo == "Barrera Doble":
+        V = np.zeros_like(XX)
+        V[(np.abs(XX - 1.5) < 0.4)] = 12.0
+        V[(np.abs(XX + 1.5) < 0.4)] = 12.0
+        return V
+    if tipo == "Coulomb":
+        r = np.sqrt(XX**2 + YY**2) + 0.5   # regularización
+        return -1.0 / r
+    if tipo == "Caja":
+        V = np.zeros_like(XX)
+        Lx = XX.max()
+        V[np.abs(XX) > 0.85 * Lx] = 50.0
+        V[np.abs(YY) > 0.85 * Lx] = 50.0
+        return V
+    return np.zeros_like(XX)
+
+
+def posicion_esperada(psi, XX, YY, M_csr):
+    """Valor esperado de posición: ⟨x⟩ y ⟨y⟩ en formulación FEM."""
+    N = len(psi)
+    Nx_Ny = XX.shape
+    x_flat = XX.ravel()
+    y_flat = YY.ravel()
+    den  = np.real(np.dot(np.conj(psi), M_csr @ psi))
+    xpsi = x_flat * psi
+    ypsi = y_flat * psi
+    ex   = np.real(np.dot(np.conj(psi), M_csr @ xpsi)) / den if den > 1e-30 else 0.0
+    ey   = np.real(np.dot(np.conj(psi), M_csr @ ypsi)) / den if den > 1e-30 else 0.0
+    return ex, ey
+
+
+def convergencia_energia_2d(Nx_list, potencial="Armónico", dt=0.002, Nt=5):
+    """
+    Calcula ⟨H⟩ en el estado inicial para distintas mallas.
+    Útil para demostrar convergencia h→0 en el informe.
+    Devuelve (lista_h, lista_E).
+    """
+    hs, Es = [], []
+    for Nx in Nx_list:
+        x, y, XX, YY, hx, hy = crear_malla_2d(Nx, Nx)
+        M, K = ensamblar_2d_lil(Nx, Nx, hx, hy)
+        V2d  = potencial_2d(XX, YY, potencial)
+        Vcsr = ensamblar_V_2d_dok(V2d.ravel())
+        psi  = gaussiana_2d(XX, YY, x0=0.0, sx=0.8, kx=0.0)
+        psi  = normalizar_2d(psi, hx, hy)
+        psi  = renormalizar_fem(psi, M)
+        E    = energia_2d(psi, K, Vcsr, M)
+        hs.append(hx)
+        Es.append(E)
+    return np.array(hs), np.array(Es)
+
+def gaussiana_2d(XX, YY, x0=-3, y0=0, sx=1.0, sy=1.0, kx=2, ky=0):
+    psi = (np.exp(-((XX - x0)**2 / (2*sx**2) + (YY - y0)**2 / (2*sy**2)))
+           * np.exp(1j * (kx*XX + ky*YY)))
+    return psi.ravel()
+
+def normalizar_2d(psi, hx, hy):
+    # Aproximación cuadratura rectangular para condición inicial
+    norm = np.sqrt(np.sum(np.abs(psi)**2) * hx * hy)
+    if norm < 1e-30:
+        raise ValueError("ψ₀ es casi cero — la gaussiana está fuera del dominio")
+    return psi / norm
+
+def renormalizar_fem(psi, M_csr):
+    """Renormaliza usando la norma FEM consistente: ‖ψ‖² = ψ†Mψ"""
+    norm2 = np.real(np.dot(np.conj(psi), M_csr @ psi))
+    if norm2 < 1e-30:
+        raise ValueError("Norma FEM casi cero — estado inválido")
+    return psi / np.sqrt(norm2)
+
+
+
+def schrodinger_CN_2d(M_csr, K_csr, V_csr, psi0, dt, Nt,
+                      border_dofs, progress_cb=None):
+
+    
+    coef_K = (hbar**2) / (2 * m)
+    coef_M = 1j * hbar / dt
+    H = coef_K * K_csr + V_csr
+    A = coef_M * M_csr + 0.5 * H
+    B = coef_M * M_csr - 0.5 * H
+
+    # Dirichlet: solo modificar A (ψ=0 en borde); en cada paso forzar rhs[borde]=0
+    A = aplicar_dirichlet_2d_csr(A, border_dofs)
+    border_arr = np.array(border_dofs, dtype=int)
+
+    psi  = psi0.copy()
+    psi[border_arr] = 0.0          # condición inicial cumple borde
+    sol  = [psi.copy()]
+
+    for step in range(Nt):
+        rhs = B @ psi
+        rhs[border_arr] = 0.0      # Dirichlet homogéneo en RHS
+        psi = spsolve(A, rhs)
+        sol.append(psi.copy())
+        if progress_cb and step % max(1, Nt//20) == 0:
+            progress_cb(int(30 + 70 * step / Nt))
+
+    return np.array(sol)
+
+
+
+def energia_2d(psi, K_csr, V_csr, M_csr):
+    """
+    Valor esperado del Hamiltoniano en formulación FEM:
+        ⟨H⟩ = (ψ† H ψ) / (ψ† M ψ)
+    donde H = (ℏ²/2m)·K + V
+    """
+    coef_K = (hbar**2) / (2 * m)
+    H      = coef_K * K_csr + V_csr
+    num    = np.real(np.dot(np.conj(psi), H @ psi))
+    den    = np.real(np.dot(np.conj(psi), M_csr @ psi))
+    return num / den if den > 1e-30 else 0.0
+
+
+
+def aplicar_tema_ax(ax, titulo=""):
+    ax.set_facecolor(PLT_FACE)
+    ax.tick_params(colors=MUTED, labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_edgecolor(BORDER)
+    ax.xaxis.label.set_color(MUTED)
+    ax.yaxis.label.set_color(MUTED)
+    if titulo:
+        ax.set_title(titulo, color=TEXT, fontsize=10, pad=10,
+                     fontfamily="monospace")
+    ax.grid(True, color=PLT_GRID, linewidth=0.5, linestyle="--", alpha=0.6)
+
+def fig_externa(figsize=(7, 5)):
+    fig, ax = plt.subplots(figsize=figsize, facecolor=PLT_BG)
+    aplicar_tema_ax(ax)
+    return fig, ax
+
+def _lighten(hex_color, factor=0.15):
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+    r = min(255, int(r + (255-r)*factor))
+    g = min(255, int(g + (255-g)*factor))
+    b = min(255, int(b + (255-b)*factor))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+
+class App:
+
+    def __init__(self, root):
+        self.root = root
+        root.title("Quantum FEM 2D Simulator")
+        root.geometry("1320x800")
+        root.configure(bg=BG)
+        root.resizable(True, True)
+
+        self.sol        = None
+        self.x          = None
+        self.y          = None
+        self.XX         = None
+        self.YY         = None
+        self.Nx = self.Ny = None
+        self._ani       = None
+
+        self._setup_styles()
+        self.build_ui()
+
+    
+    def _setup_styles(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("TCombobox",
+            fieldbackground=CARD, background=CARD,
+            foreground=TEXT, selectbackground=ACCENT,
+            selectforeground=BG, bordercolor=BORDER,
+            arrowcolor=ACCENT, font=("Courier New", 10))
+        s.configure("TProgressbar",
+            troughcolor=CARD, background=ACCENT,
+            bordercolor=BORDER, lightcolor=ACCENT,
+            darkcolor=ACCENT2, thickness=4)
+        s.map("TCombobox",
+            fieldbackground=[("readonly", CARD)],
+            foreground=[("readonly", TEXT)])
+
+    
+    def build_ui(self):
+        # Header
+        header = tk.Frame(self.root, bg="#080A0F", height=56)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        lf = tk.Frame(header, bg="#080A0F")
+        lf.pack(side="left", padx=20, pady=8)
+        tk.Label(lf, text="⬡", bg="#080A0F", fg=ACCENT,
+                 font=("Courier New", 20, "bold")).pack(side="left", padx=(0,10))
+        tf = tk.Frame(lf, bg="#080A0F")
+        tf.pack(side="left")
+        tk.Label(tf, text="QUANTUM FEM 2D", bg="#080A0F", fg=TEXT,
+                 font=("Courier New", 14, "bold")).pack(anchor="w")
+        tk.Label(tf, text="Schrödinger 2D  ·  Crank-Nicolson  ·  LIL/DOK→CSR",
+                 bg="#080A0F", fg=MUTED,
+                 font=("Courier New", 8)).pack(anchor="w")
+
+        self.lbl_status = tk.Label(header, text="● LISTO",
+                                   bg="#080A0F", fg=DIM,
+                                   font=("Courier New", 8, "bold"))
+        self.lbl_status.pack(side="right", padx=20)
+
+        tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x")
+
+        body = tk.Frame(self.root, bg=BG)
+        body.pack(fill="both", expand=True)
+
+        sidebar = tk.Frame(body, bg=PANEL, width=270)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+        tk.Frame(body, bg=BORDER, width=1).pack(side="left", fill="y")
+
+        plot_area = tk.Frame(body, bg=BG)
+        plot_area.pack(side="left", fill="both", expand=True)
+
+        self._build_sidebar(sidebar)
+        self._build_plot(plot_area)
+
+    
+    def _build_sidebar(self, parent):
+        canvas    = tk.Canvas(parent, bg=PANEL, highlightthickness=0)
+        scrollbar = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        sf        = tk.Frame(canvas, bg=PANEL)
+        sf.bind("<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0,0), window=sf, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+
+        def section_header(title, icon=""):
+            f = tk.Frame(sf, bg=PANEL)
+            f.pack(fill="x", padx=16, pady=(10,2))
+            row = tk.Frame(f, bg=PANEL)
+            row.pack(fill="x")
+            if icon:
+                tk.Label(row, text=icon, bg=PANEL, fg=ACCENT,
+                         font=("Courier New", 9)).pack(side="left", padx=(0,6))
+            tk.Label(row, text=title.upper(), bg=PANEL, fg=MUTED,
+                     font=("Courier New", 8, "bold")).pack(side="left")
+            tk.Frame(sf, bg=BORDER, height=1).pack(fill="x", padx=16, pady=(2,0))
+        def labeled_entry(label, default):
+            f = tk.Frame(sf, bg=PANEL)
+            f.pack(fill="x", padx=16, pady=3)
+            tk.Label(f, text=label, bg=PANEL, fg=MUTED,
+                     font=("Courier New", 8), anchor="w").pack(fill="x")
+            e = tk.Entry(f, bg=CARD, fg=ACCENT,
+                         insertbackground=ACCENT,
+                         relief="flat", bd=0,
+                         font=("Courier New", 11),
+                         highlightthickness=1,
+                         highlightbackground=BORDER,
+                         highlightcolor=ACCENT)
+            e.insert(0, default)
+            e.pack(fill="x", ipady=7)
+            return e
+
+        def action_btn(text, color_bg, color_fg, cmd):
+            f = tk.Frame(sf, bg=color_bg, cursor="hand2")
+            f.pack(fill="x", padx=16, pady=3)
+            lbl = tk.Label(f, text=text, bg=color_bg, fg=color_fg,
+                           font=("Courier New", 9, "bold"),
+                           padx=12, pady=7, cursor="hand2")
+            lbl.pack(fill="x")
+            for w in (f, lbl):
+                w.bind("<Button-1>", lambda e, c=cmd: c())
+                w.bind("<Enter>",
+                    lambda e, fr=f, bg=color_bg: fr.config(bg=_lighten(bg)))
+                w.bind("<Leave>",
+                    lambda e, fr=f, bg=color_bg: fr.config(bg=bg))
+
+        def ghost_btn(text, cmd):
+            f = tk.Frame(sf, bg=CARD,
+                         highlightthickness=1, highlightbackground=BORDER,
+                         cursor="hand2")
+            f.pack(fill="x", padx=16, pady=2)
+            lbl = tk.Label(f, text=text, bg=CARD, fg=TEXT,
+                           font=("Courier New", 9),
+                           padx=10, pady=5, cursor="hand2")
+            lbl.pack(fill="x")
+            for w in (f, lbl):
+                w.bind("<Button-1>", lambda e, c=cmd: c())
+                w.bind("<Enter>",
+                    lambda e: [f.config(bg=BORDER), lbl.config(bg=BORDER, fg=ACCENT)])
+                w.bind("<Leave>",
+                    lambda e: [f.config(bg=CARD), lbl.config(bg=CARD, fg=TEXT)])
+
+        # ── Malla 2D
+        section_header("Malla 2D")
+        self.eNx = labeled_entry("Nodos Nx (eje x)", "40")
+        self.eNy = labeled_entry("Nodos Ny (eje y)", "40")
+        self.lbl_nodes = tk.Label(sf, text="Nodos totales: —",
+                                  bg=PANEL, fg=MUTED,
+                                  font=("Courier New", 8))
+        self.lbl_nodes.pack(anchor="w", padx=20, pady=2)
+        for e in (self.eNx, self.eNy):
+            e.bind("<KeyRelease>", lambda ev: self._update_node_count())
+
+       
+        section_header("Paquete de onda", "ψ")
+        self.ex0 = labeled_entry("x₀  (posición inicial x)", "-3.0")
+        self.esx = labeled_entry("σx  (anchura x)", "1.0")
+        self.ekx = labeled_entry("kx  (momento x)", "2.0")
+
+        
+        section_header("Tiempo")
+        self.edt = labeled_entry("Paso dt", "0.005")
+        self.eNt = labeled_entry("Pasos Nt", "200")
+
+        
+        section_header("Potencial")
+        f_combo = tk.Frame(sf, bg=PANEL)
+        f_combo.pack(fill="x", padx=16, pady=3)
+        tk.Label(f_combo, text="Tipo", bg=PANEL, fg=MUTED,
+                 font=("Courier New", 8)).pack(anchor="w")
+        self.var_pot = tk.StringVar(value="Libre")
+        ttk.Combobox(f_combo, textvariable=self.var_pot,
+                     values=["Libre", "Armónico", "Barrera", "Barrera Doble",
+                             "Doble Pozo", "Coulomb", "Caja"],
+                     state="readonly",
+                     font=("Courier New", 10)).pack(fill="x", ipady=4)
+
+        # ── Colormap
+        section_header("Colormap")
+        f_cmap = tk.Frame(sf, bg=PANEL)
+        f_cmap.pack(fill="x", padx=16, pady=3)
+        tk.Label(f_cmap, text="Paleta de color", bg=PANEL, fg=MUTED,
+                 font=("Courier New", 8)).pack(anchor="w")
+        self.var_cmap = tk.StringVar(value="inferno")
+        ttk.Combobox(f_cmap, textvariable=self.var_cmap,
+                     values=CMAPS, state="readonly",
+                     font=("Courier New", 10)).pack(fill="x", ipady=4)
+
+        # ── Sparse info
+        section_header("Sparse Format", "◈")
+        self.lbl_sparse = tk.Label(sf, text="M/K: LIL → CSR\nV:   DOK → CSR",
+                                   bg=PANEL, fg=INFO,
+                                   font=("Courier New", 8),
+                                   justify="left")
+        self.lbl_sparse.pack(anchor="w", padx=20, pady=4)
+
+        # ── Ejecución
+        section_header("Simulación", "▶")
+        action_btn("▶  EJECUTAR", ACCENT, "#0D0F14", self.run)
+        action_btn("⬡  ANIMAR",   INFO,   "#0D0F14", self.animate)
+
+        # ── Análisis
+        section_header("Análisis", "∫")
+        ghost_btn("Norma  ψ†Mψ",      self.norma)
+        ghost_btn("⟨H⟩ Energía",      self.energy)
+        ghost_btn("⟨x⟩ ⟨y⟩ Posición", self.show_posicion)
+        ghost_btn("Convergencia h→0",  self.show_convergencia)
+
+        # ── Datos
+        section_header("Datos", "◈")
+        ghost_btn("↓ Guardar resultado",      self.save)
+        ghost_btn("↑ Cargar resultado",       self.load)
+        ghost_btn("📂 Cargar parámetros (.json)", self.load_input_file)
+        ghost_btn("💾 Guardar parámetros (.json)", self.save_input_file)
+        ghost_btn("🖼 Exportar figura (PNG)",  self.export_png)
+        ghost_btn("↺ Restablecer",            self.reset)
+
+        # Progreso
+        tk.Frame(sf, bg=PANEL, height=8).pack()
+        self.progress = ttk.Progressbar(sf, style="TProgressbar",
+                                        length=230, mode="determinate")
+        self.progress.pack(padx=16, pady=4)
+
+        tk.Frame(sf, bg=BORDER, height=1).pack(fill="x", padx=16, pady=10)
+        tk.Label(sf, text="ℏ = m = 1  |  Q4 FEM  |  LIL/DOK→CSR  |  CN",
+                 bg=PANEL, fg=DIM, font=("Courier New", 7)).pack(pady=(0,16))
+
+    
+    def _build_plot(self, parent):
+        bar = tk.Frame(parent, bg="#0F1219", height=38)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        self.lbl_plot_title = tk.Label(
+            bar, text="Sin datos — ejecuta la simulación",
+            bg="#0F1219", fg=MUTED, font=("Courier New", 9))
+        self.lbl_plot_title.pack(side="left", padx=16, pady=8)
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")
+
+        self.fig = Figure(figsize=(9, 6), facecolor=PLT_BG)
+        self.fig.subplots_adjust(left=0.08, right=0.96,
+                                 top=0.92, bottom=0.10)
+        self.ax = self.fig.add_subplot(111)
+        aplicar_tema_ax(self.ax, "")
+
+        self.canvas_plot = FigureCanvasTkAgg(self.fig, master=parent)
+        self.canvas_plot.get_tk_widget().pack(fill="both", expand=True)
+
+        self.ax.text(0.5, 0.5, "Sin datos",
+                     ha="center", va="center",
+                     color=DIM, fontsize=14, fontfamily="monospace",
+                     transform=self.ax.transAxes)
+        self.canvas_plot.draw()
+
+    
+    def run(self):
+        self._set_status("● CALCULANDO…", ACCENT)
+        self.progress["value"] = 5
+        self.root.update()
+        try:
+            self._run_inner()
+        except Exception as e:
+            self._set_status(f"● ERROR: {e}", DANGER)
+            self.progress["value"] = 0
+
+    def _run_inner(self):
+        Nx = int(self.eNx.get())
+        Ny = int(self.eNy.get())
+        dt = float(self.edt.get())
+        Nt = int(self.eNt.get())
+
+        if Nx < 4 or Ny < 4:
+            raise ValueError("Nx y Ny deben ser ≥ 4")
+        if dt <= 0:
+            raise ValueError("dt debe ser positivo")
+        if Nt < 1:
+            raise ValueError("Nt debe ser ≥ 1")
+
+        self.Nx, self.Ny = Nx, Ny
+        self.x, self.y, self.XX, self.YY, hx, hy = crear_malla_2d(Nx, Ny)
+
+        
+        self._set_status("● Ensamblando M, K  (LIL→CSR)…", INFO)
+        self.root.update()
+        M_csr, K_csr = ensamblar_2d_lil(Nx, Ny, hx, hy)
+
+        self.progress["value"] = 20
+        self.root.update()
+
+        
+        self._set_status("● Construyendo V  (DOK→CSR)…", INFO)
+        self.root.update()
+        V_2d   = potencial_2d(self.XX, self.YY, self.var_pot.get())
+        V_flat = V_2d.ravel()
+        V_csr  = ensamblar_V_2d_dok(V_flat)
+
+        self.M_csr = M_csr
+        self.K_csr = K_csr
+        self.V_csr = V_csr
+        self.V_flat = V_flat
+        self.hx, self.hy = hx, hy
+
+        
+        x0_v = float(self.ex0.get())
+        sx_v = float(self.esx.get())
+        kx_v = float(self.ekx.get())
+        psi0 = gaussiana_2d(self.XX, self.YY, x0=x0_v, sx=sx_v, kx=kx_v)
+        psi0 = normalizar_2d(psi0, hx, hy)          # aprox. rectangular
+        psi0 = renormalizar_fem(psi0, M_csr)         # renorm. FEM exacta
+
+        border_dofs = obtener_borde_dofs(Nx, Ny)
+
+        self.progress["value"] = 30
+        self.root.update()
+
+        
+        self._set_status("● Resolviendo CN  (CSR spsolve)…", INFO)
+        self.root.update()
+
+        self.sol = schrodinger_CN_2d(
+            M_csr, K_csr, V_csr, psi0, dt, Nt,
+            border_dofs,
+            progress_cb=lambda v: (
+                self.progress.__setitem__("value", v),
+                self.root.update()
+            )
+        )
+
+        self.progress["value"] = 100
+        self._plot_final(Nx, Ny, Nt, dt)
+        self._set_status("● LISTO", SUCCESS)
+
+    def _plot_final(self, Nx, Ny, Nt, dt):
+        prob    = np.abs(self.sol[-1])**2
+        prob_2d = prob.reshape(Ny, Nx)
+        cmap    = self.var_cmap.get()
+
+        self.ax.clear()
+        aplicar_tema_ax(self.ax, f"|ψ|²  —  paso final  (Nt={Nt})")
+
+        im = self.ax.pcolormesh(self.XX, self.YY, prob_2d,
+                                cmap=cmap, shading="auto")
+        # Superponer contorno del potencial (si no es libre)
+        if self.var_pot.get() != "Libre" and hasattr(self, "V_flat"):
+            V_2d = self.V_flat.reshape(Ny, Nx)
+            vmax_V = V_2d.max()
+            if vmax_V > 1e-10:
+                self.ax.contour(self.XX, self.YY, V_2d,
+                                levels=6, colors="white", alpha=0.35,
+                                linewidths=0.7)
+        if hasattr(self, "_colorbar") and self._colorbar:
+            try: self._colorbar.remove()
+            except Exception: pass
+        self._colorbar = self.fig.colorbar(im, ax=self.ax, pad=0.02)
+        self._colorbar.ax.tick_params(colors=MUTED, labelsize=7)
+
+        self.ax.set_xlabel("x", color=MUTED)
+        self.ax.set_ylabel("y", color=MUTED)
+        self.canvas_plot.draw()
+
+        self.lbl_plot_title.config(
+            text=f"|ψ|²  ·  {Nx}×{Ny}  dt={dt}  Nt={Nt}  V={self.var_pot.get()}  cmap={cmap}",
+            fg=TEXT)
+
+    def animate(self):
+        if not self._check_sol(): return
+        if self.Nx is None or self.Ny is None:
+            self._set_status("● Faltan dimensiones de malla", DANGER)
+            return
+        Nx, Ny = self.Nx, self.Ny
+        cmap = self.var_cmap.get()
+
+        plt.style.use("dark_background")
+        fig, ax = plt.subplots(figsize=(7, 6), facecolor=PLT_BG)
+        aplicar_tema_ax(ax, "Evolución temporal de |ψ|²")
+
+        prob0 = (np.abs(self.sol[0])**2).reshape(Ny, Nx)
+        vmax  = float(np.max(np.abs(self.sol)**2)) * 1.05
+        im = ax.pcolormesh(self.XX, self.YY, prob0,
+                           cmap=cmap, shading="auto",
+                           vmin=0, vmax=vmax)
+        fig.colorbar(im, ax=ax, pad=0.02)
+
+        # Contorno del potencial fijo
+        if self.var_pot.get() != "Libre" and hasattr(self, "V_flat"):
+            V_2d = self.V_flat.reshape(Ny, Nx)
+            if V_2d.max() > 1e-10:
+                ax.contour(self.XX, self.YY, V_2d,
+                           levels=5, colors="white", alpha=0.3, linewidths=0.6)
+
+        time_txt = ax.text(0.02, 0.96, "t = 0.000",
+                           transform=ax.transAxes,
+                           color=TEXT, fontsize=9, fontfamily="monospace",
+                           verticalalignment="top")
+        dt_val = float(self.edt.get())
+
+        def update(i):
+            prob = (np.abs(self.sol[i])**2).reshape(Ny, Nx)
+            im.set_array(prob.ravel())
+            time_txt.set_text(f"t = {i * dt_val:.3f}  (paso {i:04d})")
+            return im, time_txt
+
+        self._ani = FuncAnimation(fig, update,
+                                  frames=len(self.sol),
+                                  interval=45, blit=True)
+        plt.tight_layout()
+        plt.show()
+
+    def export_png(self):
+        """Exporta la figura actual a PNG."""
+        if not self._check_sol(): return
+        path = filedialog.asksaveasfilename(
+            title="Exportar figura",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("PDF", "*.pdf")])
+        if not path:
+            return
+        self.fig.savefig(path, dpi=200, bbox_inches="tight",
+                         facecolor=PLT_BG)
+        self._set_status(f"● Figura guardada: {os.path.basename(path)}", SUCCESS)
+
+    def _update_node_count(self):
+        try:
+            Nx = int(self.eNx.get())
+            Ny = int(self.eNy.get())
+            n  = Nx * Ny
+            self.lbl_nodes.config(
+                text=f"Nodos totales: {n:,}  ({Nx}×{Ny})",
+                fg=WARN if n > 3600 else MUTED)
+        except (ValueError, AttributeError):
+            pass
+
+    def _check_sol(self):
+        """Verifica que haya solución y matrices disponibles."""
+        if self.sol is None:
+            self._set_status("● Ejecuta primero la simulación", DANGER)
+            return False
+        if not hasattr(self, "M_csr"):
+            self._set_status("● Faltan matrices — re-ejecuta o carga", DANGER)
+            return False
+        return True
+
+    def norma(self):
+        if not self._check_sol(): return
+        norms = [np.real(np.dot(np.conj(p), self.M_csr @ p)) for p in self.sol]
+        dt_val = float(self.edt.get())
+        t_axis = np.arange(len(norms)) * dt_val
+        fig, ax = fig_externa(figsize=(8, 5))
+        ax.plot(t_axis, norms, color=SUCCESS, lw=1.8, label="ψ†Mψ (FEM)")
+        ax.axhline(1, color=DIM, ls="--", lw=1.0, label="ideal = 1")
+        # Banda de error ±0.1%
+        ax.fill_between(t_axis, 0.999, 1.001, color=SUCCESS, alpha=0.08)
+        desv = np.max(np.abs(np.array(norms) - 1.0))
+        ax.set_title(f"Conservación de norma  ψ†Mψ   (desv. máx = {desv:.2e})",
+                     color=TEXT, fontfamily="monospace", fontsize=10)
+        ax.set_xlabel("t (tiempo físico)", color=MUTED)
+        ax.set_ylabel("‖ψ‖²", color=MUTED)
+        ax.legend(facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT, fontsize=9)
+        plt.tight_layout(); plt.show()
+
+    def energy(self):
+        if not self._check_sol(): return
+        dt_val = float(self.edt.get())
+        t_axis = np.arange(len(self.sol)) * dt_val
+        coef_K = (hbar**2) / (2 * m)
+        H_pre  = coef_K * self.K_csr + self.V_csr
+        E = []
+        for p in self.sol:
+            num = np.real(np.dot(np.conj(p), H_pre @ p))
+            den = np.real(np.dot(np.conj(p), self.M_csr @ p))
+            E.append(num / den if den > 1e-30 else 0.0)
+        E = np.array(E)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5), facecolor=PLT_BG)
+        
+        aplicar_tema_ax(axes[0], "Energía esperada  ⟨H⟩ vs t")
+        axes[0].plot(t_axis, E, color=INFO, lw=1.8)
+        if self.var_pot.get() == "Armónico":
+            axes[0].axhline(1.0, color=WARN, ls="--", lw=0.9,
+                            label="E₀ exacta (harm. 2D) = 1.0")
+            axes[0].legend(facecolor=CARD, edgecolor=BORDER,
+                           labelcolor=TEXT, fontsize=8)
+        axes[0].set_xlabel("t", color=MUTED)
+        axes[0].set_ylabel("⟨E⟩", color=MUTED)
+        
+        aplicar_tema_ax(axes[1], "Fluctuación de ⟨H⟩ (E - E₀)")
+        E0 = E[0]
+        axes[1].plot(t_axis, E - E0, color=ACCENT2, lw=1.5)
+        axes[1].axhline(0, color=DIM, ls="--", lw=0.8)
+        axes[1].set_xlabel("t", color=MUTED)
+        axes[1].set_ylabel("ΔE", color=MUTED)
+        plt.tight_layout(); plt.show()
+
+    def show_posicion(self):
+        """Grafica ⟨x⟩(t) y ⟨y⟩(t) — trayectoria del centroide."""
+        if not self._check_sol(): return
+        dt_val = float(self.edt.get())
+        t_axis = np.arange(len(self.sol)) * dt_val
+        exs, eys = [], []
+        for p in self.sol:
+            ex, ey = posicion_esperada(p, self.XX, self.YY, self.M_csr)
+            exs.append(ex); eys.append(ey)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5), facecolor=PLT_BG)
+        aplicar_tema_ax(axes[0], "⟨x⟩(t)  y  ⟨y⟩(t)")
+        axes[0].plot(t_axis, exs, color=ACCENT,  lw=1.8, label="⟨x⟩")
+        axes[0].plot(t_axis, eys, color=INFO,    lw=1.8, label="⟨y⟩")
+        axes[0].set_xlabel("t", color=MUTED)
+        axes[0].set_ylabel("posición esperada", color=MUTED)
+        axes[0].legend(facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
+        aplicar_tema_ax(axes[1], "Trayectoria  ⟨x⟩ vs ⟨y⟩")
+        sc = axes[1].scatter(exs, eys, c=t_axis,
+                             cmap="plasma", s=6)
+        cb = fig.colorbar(sc, ax=axes[1], pad=0.02)
+        cb.ax.tick_params(colors=MUTED, labelsize=7)
+        cb.set_label("t", color=MUTED)
+        axes[1].set_xlabel("⟨x⟩", color=MUTED)
+        axes[1].set_ylabel("⟨y⟩", color=MUTED)
+        plt.tight_layout(); plt.show()
+
+    def show_convergencia(self):
+        """Análisis de convergencia ⟨H⟩ vs tamaño de malla h."""
+        self._set_status("● Calculando convergencia…", WARN)
+        self.root.update()
+        pot = self.var_pot.get()
+        Nx_list = [10, 15, 20, 25, 30, 40]
+        try:
+            hs, Es = convergencia_energia_2d(Nx_list, potencial=pot)
+        except Exception as e:
+            self._set_status(f"● ERROR convergencia: {e}", DANGER)
+            return
+        fig, ax = fig_externa(figsize=(8, 5))
+        ax.plot(hs, Es, "o-", color=ACCENT, lw=1.8, ms=7, label="⟨H⟩ FEM")
+        if pot == "Armónico":
+            ax.axhline(1.0, color=WARN, ls="--", lw=1.0,
+                       label="E₀ exacta 2D harm. = 1.0")
+        ax.set_title(f"Convergencia  ⟨H⟩ vs h   (V = {pot})",
+                     color=TEXT, fontfamily="monospace", fontsize=10)
+        ax.set_xlabel("h  (tamaño de elemento)", color=MUTED)
+        ax.set_ylabel("⟨H⟩", color=MUTED)
+        ax.legend(facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
+        plt.tight_layout(); plt.show()
+        self._set_status("● LISTO", SUCCESS)
+
+    def save(self):
+        if self.sol is None: return
+        np.save("sol_2d.npy", self.sol)
+        np.save("x_2d.npy",   self.x)
+        np.save("y_2d.npy",   self.y)
+        # Guardar metadata para que load() reconstruya correctamente
+        np.save("meta_2d.npy", np.array([
+            self.Nx, self.Ny,
+            float(self.edt.get()), float(self.eNt.get())
+        ]))
+        self._set_status("● GUARDADO", SUCCESS)
+        self.root.after(2000, lambda: self._set_status("● LISTO", SUCCESS))
+
+    def load(self):
+        if not os.path.exists("sol_2d.npy"):
+            self._set_status("● No se encontró sol_2d.npy", DANGER)
+            return
+        self.sol = np.load("sol_2d.npy")
+        self.x   = np.load("x_2d.npy")
+        self.y   = np.load("y_2d.npy")
+        # Leer metadata si existe, si no inferir de las dimensiones del array
+        if os.path.exists("meta_2d.npy"):
+            meta = np.load("meta_2d.npy")
+            Nx, Ny = int(meta[0]), int(meta[1])
+            # Restaurar parámetros en la UI
+            for entry, val in [(self.eNx, str(Nx)), (self.eNy, str(Ny)),
+                               (self.edt, str(meta[2])), (self.eNt, str(int(meta[3])))]:
+                entry.delete(0, tk.END)
+                entry.insert(0, val)
+        else:
+            Nx = len(self.x)
+            Ny = len(self.y)
+        self.Nx, self.Ny = Nx, Ny
+        self.x, self.y, self.XX, self.YY, hx, hy = crear_malla_2d(Nx, Ny)
+        self.hx, self.hy = hx, hy
+        M_csr, K_csr = ensamblar_2d_lil(Nx, Ny, hx, hy)
+        V_2d   = potencial_2d(self.XX, self.YY, self.var_pot.get())
+        V_flat = V_2d.ravel()
+        self.M_csr  = M_csr
+        self.K_csr  = K_csr
+        self.V_csr  = ensamblar_V_2d_dok(V_flat)
+        self.V_flat = V_flat
+        self._plot_final(Nx, Ny, len(self.sol) - 1, float(self.edt.get()))
+        self._set_status("● CARGADO", INFO)
+        self.root.after(2000, lambda: self._set_status("● LISTO", SUCCESS))
+
+    def reset(self):
+        for e, v in [(self.eNx, "40"), (self.eNy, "40"),
+                     (self.edt, "0.005"), (self.eNt, "200"),
+                     (self.ex0, "-3.0"), (self.esx, "1.0"), (self.ekx, "2.0")]:
+            e.delete(0, tk.END)
+            e.insert(0, v)
+        self.var_pot.set("Libre")
+        self.progress["value"] = 0
+        # Limpiar estado completamente
+        self.sol  = None
+        self.x    = self.y   = None
+        self.XX   = self.YY  = None
+        self.Nx   = self.Ny  = None
+        self._ani = None
+        for attr in ("M_csr", "K_csr", "V_csr", "V_flat", "hx", "hy", "_colorbar"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        # Restablecer gráfica
+        self.ax.clear()
+        aplicar_tema_ax(self.ax, "")
+        self.ax.text(0.5, 0.5, "Sin datos",
+                     ha="center", va="center",
+                     color=DIM, fontsize=14, fontfamily="monospace",
+                     transform=self.ax.transAxes)
+        self.canvas_plot.draw()
+        self.lbl_plot_title.config(text="Sin datos — ejecuta la simulación", fg=MUTED)
+        self._set_status("● LISTO", DIM)
+
+    def load_input_file(self):
+        """Carga parámetros de simulación desde un archivo JSON."""
+        path = filedialog.askopenfilename(
+            title="Cargar parámetros",
+            filetypes=[("JSON", "*.json"), ("Todos", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                params = json.load(f)
+            fields = {
+                "Nx": self.eNx, "Ny": self.eNy,
+                "dt": self.edt, "Nt": self.eNt,
+                "x0": self.ex0, "sx": self.esx, "kx": self.ekx,
+            }
+            for key, entry in fields.items():
+                if key in params:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, str(params[key]))
+            if "potencial" in params:
+                self.var_pot.set(params["potencial"])
+            self._set_status(f"● Parámetros cargados: {os.path.basename(path)}", SUCCESS)
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo leer el archivo:\n{e}")
+
+    def save_input_file(self):
+        """Guarda los parámetros actuales de la UI en un archivo JSON."""
+        path = filedialog.asksaveasfilename(
+            title="Guardar parámetros",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        params = {
+            "Nx":        int(self.eNx.get()),
+            "Ny":        int(self.eNy.get()),
+            "dt":        float(self.edt.get()),
+            "Nt":        int(self.eNt.get()),
+            "x0":        float(self.ex0.get()),
+            "sx":        float(self.esx.get()),
+            "kx":        float(self.ekx.get()),
+            "potencial": self.var_pot.get(),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(params, f, indent=2, ensure_ascii=False)
+        self._set_status(f"● Parámetros guardados: {os.path.basename(path)}", SUCCESS)
+
+    def _set_status(self, text, color):
+        self.lbl_status.config(text=text, fg=color)
+
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
